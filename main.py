@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -66,17 +66,32 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 
 class AgentEvent(BaseModel):
-    agent_id: str
-    session_id: str
-    action: str
-    state_before: str
-    state_after: str
-    metadata: Dict[str, Any] = {}
+    agent_id:     str = Field(..., min_length=1, max_length=128)
+    session_id:   str = Field(..., min_length=1, max_length=128)
+    action:       str = Field(..., min_length=1, max_length=256)
+    state_before: str = Field(..., min_length=1, max_length=128)
+    state_after:  str = Field(..., min_length=1, max_length=128)
+    metadata:     Dict[str, Any] = Field(default={}, max_length=64)
+
+    @field_validator("metadata")
+    @classmethod
+    def metadata_size_guard(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        serialized = json.dumps(v)
+        if len(serialized) > 16_384:  # 16 KB hard ceiling
+            raise ValueError("metadata payload exceeds 16KB limit")
+        return v
 
 
 class WorkflowDef(BaseModel):
-    name: str
-    definition: Dict[str, List[str]]
+    name:       str                      = Field(..., min_length=1, max_length=128)
+    definition: Dict[str, List[str]]     = Field(...)
+
+    @field_validator("definition")
+    @classmethod
+    def definition_not_empty(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        if not v:
+            raise ValueError("workflow definition cannot be empty")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -91,19 +106,30 @@ async def log_event(event: AgentEvent):
     2. If state_after NOT IN valid_transitions[state_before] → flag incident.
     3. Else → commit event to ledger.
     """
-    async with app.state.pool.acquire() as conn:
-        # Fetch workflow bound to this session's agent
-        row = await conn.fetchrow(
-            """
-            SELECT w.definition
-            FROM sessions s
-            JOIN workflows w ON w.name = s.agent_id
-            WHERE s.id = $1
-            """,
-            event.session_id,
-        )
+    try:
+        async with app.state.pool.acquire() as conn:
+            # Fetch workflow bound to this session's agent
+            row = await conn.fetchrow(
+                """
+                SELECT w.definition
+                FROM sessions s
+                JOIN workflows w ON w.name = s.agent_id
+                WHERE s.id = $1
+                """,
+                event.session_id,
+            )
 
-        if row:
+            if row is None:
+                # Session not found in DB — reject rather than pass silently
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "status": "session_not_found",
+                        "session_id": event.session_id,
+                        "reason": "session must be registered before submitting events",
+                    },
+                )
+
             definition = json.loads(row["definition"]) if isinstance(row["definition"], str) else row["definition"]
             valid_next = definition.get(event.state_before, [])
             if event.state_after not in valid_next:
@@ -132,18 +158,31 @@ async def log_event(event: AgentEvent):
                     },
                 )
 
-        # Authorized — commit to ledger
-        await conn.execute(
-            """
-            INSERT INTO events
-                (id, session_id, action, state_before, state_after, raw_json)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
-            """,
-            event.session_id,
-            event.action,
-            event.state_before,
-            event.state_after,
-            json.dumps(event.metadata),
+            # Authorized — commit to ledger
+            await conn.execute(
+                """
+                INSERT INTO events
+                    (id, session_id, action, state_before, state_after, raw_json)
+                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+                """,
+                event.session_id,
+                event.action,
+                event.state_before,
+                event.state_after,
+                json.dumps(event.metadata),
+            )
+
+    except HTTPException:
+        raise
+    except asyncpg.ForeignKeyViolationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "referential_integrity_violation", "detail": str(e)},
+        )
+    except asyncpg.PostgresError as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "database_error", "detail": str(e)},
         )
 
     return {"status": "committed", "session_id": event.session_id}
@@ -152,15 +191,21 @@ async def log_event(event: AgentEvent):
 @app.post("/workflow")
 async def register_workflow(workflow: WorkflowDef):
     """Commits a JSON rule-engine to the workflows table."""
-    async with app.state.pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO workflows (name, definition)
-            VALUES ($1, $2)
-            ON CONFLICT (name) DO UPDATE SET definition = EXCLUDED.definition
-            """,
-            workflow.name,
-            json.dumps(workflow.definition),
+    try:
+        async with app.state.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO workflows (name, definition)
+                VALUES ($1, $2)
+                ON CONFLICT (name) DO UPDATE SET definition = EXCLUDED.definition
+                """,
+                workflow.name,
+                json.dumps(workflow.definition),
+            )
+    except asyncpg.PostgresError as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "database_error", "detail": str(e)},
         )
     return {"status": "workflow_locked", "workflow": workflow.name}
 

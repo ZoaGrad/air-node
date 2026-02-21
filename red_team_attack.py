@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 
 import httpx
 
-BASE_URL = "http://localhost:8001"
+BASE_URL = "http://localhost:8000"
 TIMEOUT = 10.0
 
 
@@ -160,14 +160,17 @@ async def vector_2_hijacking(client: httpx.AsyncClient) -> VectorResult:
         "state_after": "ANALYZING",
     })
 
-    if r.status_code == 409:
+    if r.status_code == 404:
+        result.ok("Orphan session correctly rejected — 404 session_not_found")
+    elif r.status_code == 409:
         result.ok("Cross-session transition correctly blocked (409 incident)")
     elif r.status_code == 200:
-        result.warn(
-            "Cross-session transition committed — session not found in DB, "
-            "workflow lookup returned null, no validation applied. "
-            "HARDENING NEEDED: orphan sessions should be rejected, not passed."
+        result.fail(
+            "Cross-session transition committed — orphan session passed validation. "
+            "BREACH: unknown session_ids must be rejected at the boundary."
         )
+    elif r.status_code == 500:
+        result.fail("500 crash on orphan session — FK violation unhandled")
     else:
         result.warn(f"Unexpected status {r.status_code}: {r.text[:200]}")
 
@@ -219,8 +222,12 @@ async def vector_3_overwrite(client: httpx.AsyncClient) -> VectorResult:
             "EXPLOIT transition committed after hostile workflow overwrite — "
             "attacker successfully redefined state machine mid-session."
         )
+    elif r2.status_code == 404:
+        result.ok("EXPLOIT transition blocked — orphan session rejected (404)")
     elif r2.status_code == 409:
-        result.ok("EXPLOIT transition blocked despite workflow overwrite (session not in DB)")
+        result.ok("EXPLOIT transition blocked despite workflow overwrite (409 incident)")
+    elif r2.status_code == 500:
+        result.fail("500 crash on EXPLOIT attempt — unhandled exception in event endpoint")
     else:
         result.warn(f"Unexpected status {r2.status_code}: {r2.text[:200]}")
 
@@ -256,7 +263,7 @@ async def vector_4_concurrency(client: httpx.AsyncClient) -> VectorResult:
     vetoed = [s for s in statuses if s == 409]
 
     if crashes:
-        result.fail(f"{len(crashes)} requests crashed with 500 under load")
+        result.fail(f"{len(crashes)} requests crashed with 500 under load — unhandled concurrency error")
     else:
         result.ok("No 500 crashes under 100 concurrent requests")
 
