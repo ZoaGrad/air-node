@@ -3,6 +3,7 @@
 # CAGE: 17TJ5 | UEI: SVZVXPTM9AF4
 # Mission: Truth Preservation in Agentic Workflows
 
+import json
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
@@ -103,7 +104,7 @@ async def log_event(event: AgentEvent):
         )
 
         if row:
-            definition = row["definition"]
+            definition = json.loads(row["definition"]) if isinstance(row["definition"], str) else row["definition"]
             valid_next = definition.get(event.state_before, [])
             if event.state_after not in valid_next:
                 # Unauthorized transition — generate incident
@@ -119,7 +120,7 @@ async def log_event(event: AgentEvent):
                     event.session_id,
                     "unauthorized_state_transition",
                     f"{event.state_before} -> {event.state_after}",
-                    valid_next,
+                    json.dumps(valid_next),
                 )
                 raise HTTPException(
                     status_code=409,
@@ -142,7 +143,7 @@ async def log_event(event: AgentEvent):
             event.action,
             event.state_before,
             event.state_after,
-            event.metadata,
+            json.dumps(event.metadata),
         )
 
     return {"status": "committed", "session_id": event.session_id}
@@ -159,7 +160,7 @@ async def register_workflow(workflow: WorkflowDef):
             ON CONFLICT (name) DO UPDATE SET definition = EXCLUDED.definition
             """,
             workflow.name,
-            workflow.definition,
+            json.dumps(workflow.definition),
         )
     return {"status": "workflow_locked", "workflow": workflow.name}
 
