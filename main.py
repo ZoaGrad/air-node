@@ -3,6 +3,7 @@
 # CAGE: 17TJ5 | UEI: SVZVXPTM9AF4
 # Mission: Truth Preservation in Agentic Workflows
 
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
@@ -82,6 +83,17 @@ class AgentEvent(BaseModel):
         return v
 
 
+class AgentDef(BaseModel):
+    id:   str = Field(..., min_length=1, max_length=128)
+    name: str = Field(..., min_length=1, max_length=128)
+
+
+class SessionDef(BaseModel):
+    id:          str = Field(..., min_length=1, max_length=128)
+    agent_id:    str = Field(..., min_length=1, max_length=128)
+    workflow_id: str = Field(..., min_length=1, max_length=128)
+
+
 class WorkflowDef(BaseModel):
     name:       str                      = Field(..., min_length=1, max_length=128)
     definition: Dict[str, List[str]]     = Field(...)
@@ -108,12 +120,12 @@ async def log_event(event: AgentEvent):
     """
     try:
         async with app.state.pool.acquire() as conn:
-            # Fetch workflow bound to this session's agent
+            # Fetch workflow bound to this session
             row = await conn.fetchrow(
                 """
                 SELECT w.definition
                 FROM sessions s
-                JOIN workflows w ON w.name = s.agent_id
+                JOIN workflows w ON w.id = s.workflow_id
                 WHERE s.id = $1
                 """,
                 event.session_id,
@@ -188,17 +200,69 @@ async def log_event(event: AgentEvent):
     return {"status": "committed", "session_id": event.session_id}
 
 
-@app.post("/workflow")
-async def register_workflow(workflow: WorkflowDef):
-    """Commits a JSON rule-engine to the workflows table."""
+@app.post("/agent")
+async def register_agent(agent: AgentDef):
+    """Registers an AI entity."""
     try:
         async with app.state.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO workflows (name, definition)
+                INSERT INTO agents (id, name)
                 VALUES ($1, $2)
-                ON CONFLICT (name) DO UPDATE SET definition = EXCLUDED.definition
+                ON CONFLICT (id) DO NOTHING
                 """,
+                agent.id,
+                agent.name,
+            )
+    except asyncpg.PostgresError as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "database_error", "detail": str(e)},
+        )
+    return {"status": "agent_registered", "agent_id": agent.id}
+
+
+@app.post("/session")
+async def register_session(session: SessionDef):
+    """Initializes a bounded chronography for an agent."""
+    try:
+        async with app.state.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sessions (id, agent_id, workflow_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                session.id,
+                session.agent_id,
+                session.workflow_id,
+            )
+    except asyncpg.ForeignKeyViolationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "referential_integrity_violation", "detail": str(e)},
+        )
+    except asyncpg.PostgresError as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "database_error", "detail": str(e)},
+        )
+    return {"status": "session_registered", "session_id": session.id}
+
+
+@app.post("/workflow")
+async def register_workflow(workflow: WorkflowDef):
+    """Commits a JSON rule-engine to the workflows table."""
+    workflow_id = hashlib.sha256((workflow.name + json.dumps(workflow.definition, sort_keys=True)).encode()).hexdigest()[:16]
+    try:
+        async with app.state.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO workflows (id, name, definition)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                workflow_id,
                 workflow.name,
                 json.dumps(workflow.definition),
             )
@@ -207,7 +271,7 @@ async def register_workflow(workflow: WorkflowDef):
             status_code=500,
             detail={"status": "database_error", "detail": str(e)},
         )
-    return {"status": "workflow_locked", "workflow": workflow.name}
+    return {"status": "workflow_locked", "workflow_id": workflow_id}
 
 
 @app.get("/incidents")
