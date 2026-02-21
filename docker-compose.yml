@@ -1,0 +1,23 @@
+# A.I.R. — Agent Incident Recorder
+# VaultNode // Blackglass Continuum LLC
+# CAGE: 17TJ5 | UEI: SVZVXPTM9AF4
+
+version: '3.8'
+
+services:
+  air-db:
+    image: postgres:15-alpine
+    container_name: air_vault_db
+    environment:
+      POSTGRES_USER: ${AIR_DB_USER}
+      POSTGRES_PASSWORD: ${AIR_DB_PASSWORD}
+      POSTGRES_DB: ${AIR_DB_NAME}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - air_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  air_db_data:
