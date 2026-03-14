@@ -5,11 +5,13 @@
 
 import hashlib
 import json
+import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 
@@ -24,11 +26,44 @@ class Settings(BaseSettings):
     air_db_name: str
     air_db_host: str = "localhost"
     air_db_port: int = 5432
+    # IA-2: Telemetry channel key. If set, /incidents enforces X-API-Key auth.
+    # Leave unset only in local dev (no key = unenforced, logs warning on startup).
+    air_node_api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency — enforces X-API-Key on protected routes
+# ---------------------------------------------------------------------------
+
+_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def require_api_key(key: str | None = Security(_API_KEY_HEADER)) -> None:
+    """
+    FastAPI dependency: validates X-API-Key against AIR_NODE_API_KEY.
+    - If AIR_NODE_API_KEY is not configured: 401 (server misconfigured)
+    - If key is missing from request:        401
+    - If key does not match:                 403
+    """
+    if not settings.air_node_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="AIR_NODE_API_KEY not configured on server — /incidents is locked.",
+        )
+    if key is None:
+        raise HTTPException(
+            status_code=401,
+            detail="X-API-Key header required.",
+        )
+    if key != settings.air_node_api_key:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API key.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +309,7 @@ async def register_workflow(workflow: WorkflowDef):
     return {"status": "workflow_locked", "workflow_id": workflow_id}
 
 
-@app.get("/incidents")
+@app.get("/incidents", dependencies=[Depends(require_api_key)])
 async def list_incidents():
     """Returns the absolute proof of agent drift."""
     async with app.state.pool.acquire() as conn:
