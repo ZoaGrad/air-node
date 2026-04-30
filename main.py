@@ -3,8 +3,8 @@
 # CAGE: 17TJ5 | UEI: SVZVXPTM9AF4
 # Mission: Truth Preservation in Agentic Workflows
 
-import hashlib
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -14,6 +14,13 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
+from invariants import (
+    canonicalize_workflow_definition,
+    classify_session_registration,
+    classify_workflow_registration,
+    compute_workflow_id,
+    resolve_session_workflow_definition,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +41,29 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 settings = Settings()
+logger = logging.getLogger("air_node")
+
+
+def raise_invalid_reference(route_name: str, exc: Exception) -> None:
+    logger.warning("Invalid reference in %s", route_name, exc_info=exc)
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "invalid_reference",
+            "message": "referenced entity does not exist",
+        },
+    ) from None
+
+
+def raise_db_fault(route_name: str, exc: Exception) -> None:
+    logger.exception("Database fault in %s", route_name)
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "code": "db_fault",
+            "message": "internal database fault",
+        },
+    ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -155,29 +185,19 @@ async def log_event(event: AgentEvent):
     """
     try:
         async with app.state.pool.acquire() as conn:
-            # Fetch workflow bound to this session
+            # Resolve session existence separately from workflow availability.
             row = await conn.fetchrow(
                 """
-                SELECT w.definition
+                SELECT
+                    s.workflow_id,
+                    w.definition AS workflow_definition
                 FROM sessions s
-                JOIN workflows w ON w.id = s.workflow_id
+                LEFT JOIN workflows w ON w.id = s.workflow_id
                 WHERE s.id = $1
                 """,
                 event.session_id,
             )
-
-            if row is None:
-                # Session not found in DB — reject rather than pass silently
-                raise HTTPException(
-                    status_code=404,
-                    detail={
-                        "status": "session_not_found",
-                        "session_id": event.session_id,
-                        "reason": "session must be registered before submitting events",
-                    },
-                )
-
-            definition = json.loads(row["definition"]) if isinstance(row["definition"], str) else row["definition"]
+            definition = resolve_session_workflow_definition(row, event.session_id)
             valid_next = definition.get(event.state_before, [])
             if event.state_after not in valid_next:
                 # Unauthorized transition — generate incident
@@ -222,15 +242,9 @@ async def log_event(event: AgentEvent):
     except HTTPException:
         raise
     except asyncpg.ForeignKeyViolationError as e:
-        raise HTTPException(
-            status_code=400,
-            detail={"status": "referential_integrity_violation", "detail": str(e)},
-        )
+        raise_invalid_reference("/event", e)
     except asyncpg.PostgresError as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"status": "database_error", "detail": str(e)},
-        )
+        raise_db_fault("/event", e)
 
     return {"status": "committed", "session_id": event.session_id}
 
@@ -250,10 +264,7 @@ async def register_agent(agent: AgentDef):
                 agent.name,
             )
     except asyncpg.PostgresError as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"status": "database_error", "detail": str(e)},
-        )
+        raise_db_fault("/agent", e)
     return {"status": "agent_registered", "agent_id": agent.id}
 
 
@@ -262,74 +273,110 @@ async def register_session(session: SessionDef):
     """Initializes a bounded chronography for an agent."""
     try:
         async with app.state.pool.acquire() as conn:
-            await conn.execute(
+            inserted = await conn.fetchrow(
                 """
                 INSERT INTO sessions (id, agent_id, workflow_id)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (id) DO NOTHING
+                RETURNING id
                 """,
                 session.id,
                 session.agent_id,
                 session.workflow_id,
             )
+            if inserted is not None:
+                return classify_session_registration(
+                    None, session.id, session.agent_id, session.workflow_id
+                )
+
+            existing = await conn.fetchrow(
+                """
+                SELECT agent_id, workflow_id
+                FROM sessions
+                WHERE id = $1
+                """,
+                session.id,
+            )
+            return classify_session_registration(
+                existing, session.id, session.agent_id, session.workflow_id
+            )
     except asyncpg.ForeignKeyViolationError as e:
-        raise HTTPException(
-            status_code=400,
-            detail={"status": "referential_integrity_violation", "detail": str(e)},
-        )
+        raise_invalid_reference("/session", e)
     except asyncpg.PostgresError as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"status": "database_error", "detail": str(e)},
-        )
-    return {"status": "session_registered", "session_id": session.id}
+        raise_db_fault("/session", e)
 
 
 @app.post("/workflow")
 async def register_workflow(workflow: WorkflowDef):
     """Commits a JSON rule-engine to the workflows table."""
-    workflow_id = hashlib.sha256((workflow.name + json.dumps(workflow.definition, sort_keys=True)).encode()).hexdigest()[:16]
+    canonical_definition = canonicalize_workflow_definition(workflow.definition)
+    workflow_id = compute_workflow_id(workflow.definition)
     try:
         async with app.state.pool.acquire() as conn:
-            await conn.execute(
+            inserted = await conn.fetchrow(
                 """
                 INSERT INTO workflows (id, name, definition)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (id) DO NOTHING
+                RETURNING id, name, definition
                 """,
                 workflow_id,
                 workflow.name,
-                json.dumps(workflow.definition),
+                canonical_definition,
+            )
+            if inserted is not None:
+                return classify_workflow_registration(
+                    None,
+                    workflow_id,
+                    workflow.name,
+                    canonical_definition,
+                )
+
+            existing = await conn.fetchrow(
+                """
+                SELECT id, name, definition
+                FROM workflows
+                WHERE id = $1
+                """,
+                workflow_id,
+            )
+            return classify_workflow_registration(
+                existing,
+                workflow_id,
+                workflow.name,
+                canonical_definition,
             )
     except asyncpg.PostgresError as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"status": "database_error", "detail": str(e)},
-        )
-    return {"status": "workflow_locked", "workflow_id": workflow_id}
+        raise_db_fault("/workflow", e)
 
 
 @app.get("/incidents", dependencies=[Depends(require_api_key)])
 async def list_incidents():
     """Returns the absolute proof of agent drift."""
-    async with app.state.pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM incidents ORDER BY created_at DESC"
-        )
+    try:
+        async with app.state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM incidents ORDER BY created_at DESC"
+            )
+    except asyncpg.PostgresError as e:
+        raise_db_fault("/incidents", e)
     return {"incidents": [dict(r) for r in rows]}
 
 
 @app.get("/session/{session_id}")
 async def replay_session(session_id: str):
     """Reconstructs the exact chronological timeline of an agent's actions."""
-    async with app.state.pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, timestamp, action, state_before, state_after
-            FROM events
-            WHERE session_id = $1
-            ORDER BY timestamp ASC
-            """,
-            session_id,
-        )
+    try:
+        async with app.state.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, timestamp, action, state_before, state_after
+                FROM events
+                WHERE session_id = $1
+                ORDER BY timestamp ASC
+                """,
+                session_id,
+            )
+    except asyncpg.PostgresError as e:
+        raise_db_fault("/session/{session_id}", e)
     return {"session_id": session_id, "timeline": [dict(r) for r in rows]}
