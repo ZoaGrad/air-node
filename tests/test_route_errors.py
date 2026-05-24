@@ -1,4 +1,5 @@
 import unittest
+import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -379,29 +380,74 @@ class RouteDbErrorTests(unittest.TestCase):
             execute=AsyncMock(return_value="INSERT 0 1"),
         )
 
-        with client_for_connection(conn) as client:
-            response = client.post(
-                "/event",
-                json={
-                    "agent_id": "agent-1",
-                    "session_id": "session-1",
-                    "action": "step",
-                    "state_before": "IDLE",
-                    "state_after": "EXECUTING",
-                    "metadata": {},
-                },
-            )
+        incident_uuid = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        with patch.object(main.uuid, "uuid4", return_value=incident_uuid):
+            with client_for_connection(conn) as client:
+                response = client.post(
+                    "/event",
+                    json={
+                        "agent_id": "agent-1",
+                        "session_id": "session-1",
+                        "action": "step",
+                        "state_before": "IDLE",
+                        "state_after": "EXECUTING",
+                        "metadata": {},
+                    },
+                )
 
         self.assert_route_error_response(
             response,
             409,
             {
                 "status": "incident_flagged",
-                "incident_id": "INC-session-1-step",
+                "incident_id": f"INC-{incident_uuid}",
                 "observed": "IDLE -> EXECUTING",
                 "authorized": ["ANALYZING"],
             },
         )
+        self.assertNotIn("ON CONFLICT", conn.execute.call_args.args[0])
+
+    def test_repeated_invalid_transition_records_distinct_incidents(self) -> None:
+        conn = SimpleNamespace(
+            fetchrow=AsyncMock(
+                return_value={
+                    "workflow_id": "wf-1",
+                    "workflow_definition": {"IDLE": ["ANALYZING"]},
+                }
+            ),
+            execute=AsyncMock(return_value="INSERT 0 1"),
+        )
+        incident_uuids = [
+            uuid.UUID("11111111-1111-4111-8111-111111111111"),
+            uuid.UUID("22222222-2222-4222-8222-222222222222"),
+        ]
+        payload = {
+            "agent_id": "agent-1",
+            "session_id": "session-1",
+            "action": "step",
+            "state_before": "IDLE",
+            "state_after": "EXECUTING",
+            "metadata": {},
+        }
+
+        with patch.object(main.uuid, "uuid4", side_effect=incident_uuids):
+            with client_for_connection(conn) as client:
+                first_response = client.post("/event", json=payload)
+                second_response = client.post("/event", json=payload)
+
+        self.assertEqual(first_response.status_code, 409)
+        self.assertEqual(second_response.status_code, 409)
+        self.assertEqual(
+            first_response.json()["detail"]["incident_id"],
+            f"INC-{incident_uuids[0]}",
+        )
+        self.assertEqual(
+            second_response.json()["detail"]["incident_id"],
+            f"INC-{incident_uuids[1]}",
+        )
+        self.assertEqual(conn.execute.await_count, 2)
+        self.assertEqual(conn.execute.await_args_list[0].args[1], f"INC-{incident_uuids[0]}")
+        self.assertEqual(conn.execute.await_args_list[1].args[1], f"INC-{incident_uuids[1]}")
 
     def test_session_already_registered_is_returned_by_route(self) -> None:
         conn = SimpleNamespace(
