@@ -6,6 +6,7 @@
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -200,14 +201,13 @@ async def log_event(event: AgentEvent):
             definition = resolve_session_workflow_definition(row, event.session_id)
             valid_next = definition.get(event.state_before, [])
             if event.state_after not in valid_next:
-                # Unauthorized transition — generate incident
-                incident_id = f"INC-{event.session_id}-{event.action}"
+                # Unauthorized transition: every observed violation gets its own record.
+                incident_id = f"INC-{uuid.uuid4()}"
                 await conn.execute(
                     """
                     INSERT INTO incidents
                         (id, session_id, reason, observed_transition, expected_transition)
                     VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (id) DO NOTHING
                     """,
                     incident_id,
                     event.session_id,
